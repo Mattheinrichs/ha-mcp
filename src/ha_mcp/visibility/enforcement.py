@@ -71,6 +71,7 @@ from ..renamed_tools import current_tool_name
 from ..tool_dispatch import CALL_PROXY_META_TOOLS, coerce_proxy_arguments
 from ..tools.helpers import raise_tool_error
 from . import resolver
+from .error_payloads import tool_error_reveals_hidden
 from .identifier_aliases import (
     IdentifierAliases,
     build_identifier_aliases,
@@ -459,11 +460,6 @@ def _scrub_state_result(result: ToolResult, matcher: _HiddenMatcher) -> _ScrubTa
     )
 
 
-def _tool_error_text(exc: ToolError) -> str:
-    """The scannable text of a tool-raised error (its JSON payload args)."""
-    return "\n".join(str(arg) for arg in (getattr(exc, "args", None) or ()))
-
-
 def _unscannable_reason(name: str, args: dict[str, Any]) -> str | None:
     """Reason this call's output cannot be scanned, or None if it can.
 
@@ -647,6 +643,15 @@ class _VisibilityEnforcementBase(Middleware):
         """Resolve the hidden set, aliases and regex through the module-shared cache."""
         return await _hidden_cache.get(config, self._get_client(), fresh=fresh)
 
+    async def _load_matcher(
+        self, name: str, config: VisibilityConfig, *, fresh: bool = False
+    ) -> _HiddenMatcher:
+        """The enforced hidden set, or the fail-closed refusal for this call."""
+        try:
+            return await self._hidden_matcher(config, fresh=fresh)
+        except VisibilityDataUnavailable:
+            _raise_enforced(name, _FAIL_CLOSED_REASON)
+
 
 class VisibilityInboundEnforcement(_VisibilityEnforcementBase):
     """Pre-execution half: unscannable refusals + argument conceal/refuse.
@@ -686,12 +691,11 @@ class VisibilityInboundEnforcement(_VisibilityEnforcementBase):
             )
             _raise_enforced(effective_name, reason)
 
-        try:
-            matcher = await self._hidden_matcher(
-                config, fresh=is_trace_query(effective_name, effective_args)
-            )
-        except VisibilityDataUnavailable:
-            _raise_enforced(effective_name, _FAIL_CLOSED_REASON)
+        matcher = await self._load_matcher(
+            effective_name,
+            config,
+            fresh=is_trace_query(effective_name, effective_args),
+        )
 
         bare = hidden_identifier_argument(
             effective_name, effective_args, matcher.identifier_aliases
@@ -747,10 +751,7 @@ class VisibilityOutboundEnforcement(_VisibilityEnforcementBase):
         config = await self._active_config(effective_name)
         if config is None:
             return await call_next(context)
-        try:
-            matcher = await self._hidden_matcher(config)
-        except VisibilityDataUnavailable:
-            _raise_enforced(effective_name, _FAIL_CLOSED_REASON)
+        matcher = await self._load_matcher(effective_name, config)
         return await self._call_and_scan_outbound(
             effective_name, effective_args, config, context, call_next, matcher
         )
@@ -765,20 +766,21 @@ class VisibilityOutboundEnforcement(_VisibilityEnforcementBase):
         matcher: _HiddenMatcher,
     ) -> Any:
         """Run the tool; refuse if its output (or a tool error) names a hidden id."""
+        error: ToolError | None = None
         try:
             result = await call_next(context)
         except ToolError as exc:
-            if matcher.embeds(_tool_error_text(exc)):
+            error = exc
+        if is_trace_query(name, args):
+            # The tool can register the item that keys the run it stores or names
+            # in an error, so the pre-call set may lack that key: rescan with a
+            # post-call set, once, for either outcome.
+            matcher = await self._load_matcher(name, config, fresh=True)
+        if error is not None:
+            if tool_error_reveals_hidden(error, name, args, matcher):
                 logger.info("visibility enforce: refused tool error from %s", name)
                 _raise_enforced(name, _outbound_reason(name))
-            raise
-        if is_trace_query(name, args):
-            # The tool can register the item that keys the run it stores, so the
-            # pre-call set may lack that key: rescan with a post-call set.
-            try:
-                matcher = await self._hidden_matcher(config, fresh=True)
-            except VisibilityDataUnavailable:
-                _raise_enforced(name, _FAIL_CLOSED_REASON)
+            raise error
         scrub_tally = _ScrubTally(0, 0, 0)
         if name == _STATE_TOOL:
             scrub_tally = _scrub_state_result(result, matcher)
