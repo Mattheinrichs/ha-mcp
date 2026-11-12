@@ -28,9 +28,8 @@ from ha_mcp.client.rest_client import (
     HomeAssistantClient,
     HomeAssistantConnectionError,
 )
-from ha_mcp.errors import ErrorCode, create_error_response
-from ha_mcp.tools.helpers import raise_tool_error
 from ha_mcp.tools.tools_traces import TraceTools
+from ha_mcp.tools.trace_lookup import _raise_context_not_found
 from ha_mcp.visibility.model import VisibilityConfig
 
 from .._trace_fixtures import automation_run, script_run, store_runs
@@ -714,22 +713,6 @@ async def _register_late_run(
     )
 
 
-def _raise_late_trace_error() -> None:
-    """Raise the trace tool's not-found, whose context carries the resolved key."""
-    raise_tool_error(
-        create_error_response(
-            ErrorCode.RESOURCE_NOT_FOUND,
-            "No trace found for context: own-late",
-            context={
-                "context_id": "own-late",
-                "domain": "automation",
-                "item_id": _LATE_AUTOMATION_KEY,
-                "scanned": 0,
-            },
-        )
-    )
-
-
 class TestItemRegisteredDuringTheQuery:
     """The outbound scan never trusts the set it read before the tool ran."""
 
@@ -816,7 +799,7 @@ class TestItemRegisteredDuringTheQuery:
         async def _call(_context: Any) -> Any:
             ran.append("ran")
             await _register_late_run(hass, entity_registry)
-            _raise_late_trace_error()
+            _raise_context_not_found("own-late", "automation", _LATE_AUTOMATION_KEY, 0)
 
         with patch.object(
             core_client,
@@ -854,7 +837,7 @@ class TestItemRegisteredDuringTheQuery:
                 "get_states",
                 AsyncMock(side_effect=HomeAssistantConnectionError("no answer")),
             )
-            _raise_late_trace_error()
+            _raise_context_not_found("own-late", "automation", _LATE_AUTOMATION_KEY, 0)
 
         with pytest.raises(ToolError) as exc_info:
             await mw.on_call_tool(
